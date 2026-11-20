@@ -1,0 +1,361 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/pontclavier
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PontClavier"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.pontclavier"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.pontclavier"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <application
+                  android:label="Pont Clavier"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/pontclavier/MainActivity.kt <<'EOF'
+          package com.pontclavier
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.bluetooth.BluetoothAdapter
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothHidDevice
+          import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothProfile
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.KeyEvent
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.concurrent.Executors
+
+          @SuppressLint("MissingPermission")
+          class MainActivity : Activity() {
+
+              private var adapter: BluetoothAdapter? = null
+              private var hid: BluetoothHidDevice? = null
+              private var host: BluetoothDevice? = null
+              private lateinit var status: TextView
+              private lateinit var lastKey: TextView
+              private var mods = 0
+              private val pressed = ArrayList<Int>()
+
+              private val descriptor: ByteArray = intArrayOf(
+                  0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
+                  0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
+                  0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+                  0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+                  0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,
+                  0x95, 0x01, 0x75, 0x03, 0x91, 0x01,
+                  0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+                  0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
+                  0xC0
+              ).map { it.toByte() }.toByteArray()
+
+              private val modMap = mapOf(
+                  KeyEvent.KEYCODE_CTRL_LEFT to 0x01,
+                  KeyEvent.KEYCODE_SHIFT_LEFT to 0x02,
+                  KeyEvent.KEYCODE_ALT_LEFT to 0x04,
+                  KeyEvent.KEYCODE_META_LEFT to 0x08,
+                  KeyEvent.KEYCODE_CTRL_RIGHT to 0x10,
+                  KeyEvent.KEYCODE_SHIFT_RIGHT to 0x20,
+                  KeyEvent.KEYCODE_ALT_RIGHT to 0x40,
+                  KeyEvent.KEYCODE_META_RIGHT to 0x80
+              )
+
+              private val keyMap = HashMap<Int, Int>().apply {
+                  for (i in 0..25) put(KeyEvent.KEYCODE_A + i, 0x04 + i)
+                  for (i in 0..8) put(KeyEvent.KEYCODE_1 + i, 0x1E + i)
+                  put(KeyEvent.KEYCODE_0, 0x27)
+                  for (i in 0..11) put(KeyEvent.KEYCODE_F1 + i, 0x3A + i)
+                  for (i in 0..8) put(KeyEvent.KEYCODE_NUMPAD_1 + i, 0x59 + i)
+                  put(KeyEvent.KEYCODE_NUMPAD_0, 0x62)
+                  putAll(mapOf(
+                      KeyEvent.KEYCODE_ENTER to 0x28,
+                      KeyEvent.KEYCODE_ESCAPE to 0x29,
+                      KeyEvent.KEYCODE_DEL to 0x2A,
+                      KeyEvent.KEYCODE_TAB to 0x2B,
+                      KeyEvent.KEYCODE_SPACE to 0x2C,
+                      KeyEvent.KEYCODE_MINUS to 0x2D,
+                      KeyEvent.KEYCODE_EQUALS to 0x2E,
+                      KeyEvent.KEYCODE_LEFT_BRACKET to 0x2F,
+                      KeyEvent.KEYCODE_RIGHT_BRACKET to 0x30,
+                      KeyEvent.KEYCODE_BACKSLASH to 0x31,
+                      KeyEvent.KEYCODE_SEMICOLON to 0x33,
+                      KeyEvent.KEYCODE_APOSTROPHE to 0x34,
+                      KeyEvent.KEYCODE_GRAVE to 0x35,
+                      KeyEvent.KEYCODE_COMMA to 0x36,
+                      KeyEvent.KEYCODE_PERIOD to 0x37,
+                      KeyEvent.KEYCODE_SLASH to 0x38,
+                      KeyEvent.KEYCODE_CAPS_LOCK to 0x39,
+                      KeyEvent.KEYCODE_SYSRQ to 0x46,
+                      KeyEvent.KEYCODE_SCROLL_LOCK to 0x47,
+                      KeyEvent.KEYCODE_BREAK to 0x48,
+                      KeyEvent.KEYCODE_INSERT to 0x49,
+                      KeyEvent.KEYCODE_MOVE_HOME to 0x4A,
+                      KeyEvent.KEYCODE_PAGE_UP to 0x4B,
+                      KeyEvent.KEYCODE_FORWARD_DEL to 0x4C,
+                      KeyEvent.KEYCODE_MOVE_END to 0x4D,
+                      KeyEvent.KEYCODE_PAGE_DOWN to 0x4E,
+                      KeyEvent.KEYCODE_DPAD_RIGHT to 0x4F,
+                      KeyEvent.KEYCODE_DPAD_LEFT to 0x50,
+                      KeyEvent.KEYCODE_DPAD_DOWN to 0x51,
+                      KeyEvent.KEYCODE_DPAD_UP to 0x52,
+                      KeyEvent.KEYCODE_NUM_LOCK to 0x53,
+                      KeyEvent.KEYCODE_NUMPAD_DIVIDE to 0x54,
+                      KeyEvent.KEYCODE_NUMPAD_MULTIPLY to 0x55,
+                      KeyEvent.KEYCODE_NUMPAD_SUBTRACT to 0x56,
+                      KeyEvent.KEYCODE_NUMPAD_ADD to 0x57,
+                      KeyEvent.KEYCODE_NUMPAD_ENTER to 0x58,
+                      KeyEvent.KEYCODE_NUMPAD_DOT to 0x63
+                  ))
+              }
+
+              private val callback = object : BluetoothHidDevice.Callback() {
+                  override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+                      runOnUiThread {
+                          setStatus(
+                              if (registered) "Prêt. Rends le téléphone visible, puis associe-le depuis l'iPad."
+                              else "Non enregistré"
+                          )
+                      }
+                  }
+
+                  override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
+                      runOnUiThread {
+                          if (state == BluetoothProfile.STATE_CONNECTED) {
+                              host = device
+                              setStatus("Connecté à " + (device?.name ?: "l'appareil") + ". Tape sur le clavier USB !")
+                          } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
+                              if (device == host) host = null
+                              pressed.clear()
+                              mods = 0
+                              setStatus("Déconnecté")
+                          }
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                  }
+                  status = TextView(this).apply { textSize = 18f; text = "Démarrage…" }
+                  lastKey = TextView(this).apply { textSize = 16f; setPadding(0, 48, 0, 0) }
+                  val b1 = Button(this).apply {
+                      text = "1. Rendre le téléphone visible"
+                      setOnClickListener {
+                          startActivity(
+                              Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                                  .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120)
+                          )
+                      }
+                  }
+                  val b2 = Button(this).apply {
+                      text = "2. Se connecter à l'iPad (déjà associé)"
+                      setOnClickListener { chooseDevice() }
+                  }
+                  root.addView(status)
+                  root.addView(b1)
+                  root.addView(b2)
+                  root.addView(lastKey)
+                  setContentView(root)
+
+                  if (Build.VERSION.SDK_INT >= 31 &&
+                      checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(
+                          arrayOf(
+                              Manifest.permission.BLUETOOTH_CONNECT,
+                              Manifest.permission.BLUETOOTH_ADVERTISE,
+                              Manifest.permission.BLUETOOTH_SCAN
+                          ), 1
+                      )
+                  } else {
+                      initBluetooth()
+                  }
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  initBluetooth()
+              }
+
+              private fun setStatus(s: String) { status.text = s }
+
+              private fun initBluetooth() {
+                  val ad = getSystemService(BluetoothManager::class.java)?.adapter
+                  adapter = ad
+                  if (ad == null || !ad.isEnabled) {
+                      setStatus("Active le Bluetooth puis relance l'app.")
+                      return
+                  }
+                  ad.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
+                      override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                          if (profile == BluetoothProfile.HID_DEVICE) {
+                              hid = proxy as BluetoothHidDevice
+                              val sdp = BluetoothHidDeviceAppSdpSettings(
+                                  "Pont Clavier", "Clavier USB vers Bluetooth", "Pont",
+                                  BluetoothHidDevice.SUBCLASS1_KEYBOARD, descriptor
+                              )
+                              hid?.registerApp(sdp, null, null, Executors.newSingleThreadExecutor(), callback)
+                          }
+                      }
+
+                      override fun onServiceDisconnected(profile: Int) {
+                          hid = null
+                      }
+                  }, BluetoothProfile.HID_DEVICE)
+              }
+
+              private fun chooseDevice() {
+                  val list = adapter?.bondedDevices?.toList() ?: emptyList()
+                  if (list.isEmpty()) {
+                      setStatus("Aucun appareil associé. Fais d'abord l'étape 1 et associe depuis l'iPad.")
+                      return
+                  }
+                  val names = list.map { it.name ?: it.address }.toTypedArray()
+                  AlertDialog.Builder(this)
+                      .setTitle("Choisis l'iPad")
+                      .setItems(names) { _, i -> hid?.connect(list[i]) }
+                      .show()
+              }
+
+              private fun sendReport() {
+                  val h = host ?: return
+                  val r = ByteArray(8)
+                  r[0] = mods.toByte()
+                  for (i in 0 until minOf(6, pressed.size)) r[2 + i] = pressed[i].toByte()
+                  hid?.sendReport(h, 1, r)
+              }
+
+              override fun dispatchKeyEvent(e: KeyEvent): Boolean {
+                  val kc = e.keyCode
+                  if (host == null ||
+                      kc == KeyEvent.KEYCODE_BACK ||
+                      kc == KeyEvent.KEYCODE_VOLUME_UP ||
+                      kc == KeyEvent.KEYCODE_VOLUME_DOWN ||
+                      kc == KeyEvent.KEYCODE_POWER
+                  ) return super.dispatchKeyEvent(e)
+
+                  val modBit = modMap[kc]
+                  val usage: Int? = if (e.scanCode == 86) 0x64 else keyMap[kc]
+                  if (modBit == null && usage == null) return super.dispatchKeyEvent(e)
+
+                  if (e.action == KeyEvent.ACTION_DOWN) {
+                      if (e.repeatCount > 0) return true
+                      if (modBit != null) mods = mods or modBit
+                      else if (usage != null && !pressed.contains(usage)) pressed.add(usage)
+                  } else if (e.action == KeyEvent.ACTION_UP) {
+                      if (modBit != null) mods = mods and modBit.inv()
+                      else if (usage != null) pressed.remove(usage)
+                  }
+                  sendReport()
+                  lastKey.text = "Dernière touche : " + KeyEvent.keyCodeToString(kc)
+                  return true
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  pressed.clear()
+                  mods = 0
+                  sendReport()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  hid?.unregisterApp()
+                  adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hid)
+              }
+          }
+          EOF
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Pont Clavier v${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
